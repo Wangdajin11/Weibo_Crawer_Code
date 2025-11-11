@@ -138,7 +138,7 @@ class WeiboAdvancedSearchCrawler:
         self.header = self.login_with_selenium()
         
         # 数据保存路径
-        self.base_path = r"D:\学习文件\休闲&兴趣\文章\论文\脑机接口"
+        self.base_path = r""   #修改为自己的保存路径
         
         # 任务队列
         self.task_queue = Queue()
@@ -180,14 +180,14 @@ class WeiboAdvancedSearchCrawler:
     def login_with_selenium(self):
         """使用Selenium自动化登录获取Cookie"""
         print("\n" + "="*80)
-        print("🚀 启动微博自动化登录...")
+        print("启动微博自动化登录...")
         print("="*80)
         
         try:
             self.driver.get("https://weibo.com/login.php")
             
-            print("📝 请在弹出的浏览器窗口中完成微博登录...")
-            print("💡 提示：")
+            print("请在弹出的浏览器窗口中完成微博登录...")
+            print("提示：")
             print("   - 如果出现扫码登录，请使用微博APP扫码")
             print("   - 如果使用账号密码登录，请确保账号正确")
             print("   - 登录成功后，请在控制台按回车继续")
@@ -216,20 +216,20 @@ class WeiboAdvancedSearchCrawler:
             xsrf_match = re.search(r'XSRF-TOKEN=([^;]+)', cookie_str)
             if xsrf_match:
                 header['X-XSRF-TOKEN'] = xsrf_match.group(1)
-                print(f"✅ 提取到XSRF-TOKEN: {xsrf_match.group(1)[:10]}...")
+                print(f"提取到XSRF-TOKEN: {xsrf_match.group(1)[:10]}...")
             
-            print(f"✅ 成功获取Cookie（长度：{len(cookie_str)}字符）")
+            print(f"成功获取Cookie（长度：{len(cookie_str)}字符）")
             
             # 测试Cookie有效性
             if self.test_cookie_effectiveness(header):
-                print("✅ Cookie有效性测试通过！")
+                print("Cookie有效性测试通过！")
             else:
-                print("⚠️ Cookie测试未通过，但继续运行...")
+                print("Cookie测试未通过，但继续运行...")
             
             return header
             
         except Exception as e:
-            print(f"❌ 自动化登录失败: {e}")
+            print(f"自动化登录失败: {e}")
             traceback.print_exc()
             raise
     
@@ -261,26 +261,26 @@ class WeiboAdvancedSearchCrawler:
             
             if response.status_code == 200:
                 if response.text.startswith('<!DOCTYPE') or response.text.startswith('<html'):
-                    print("   ❌ 返回了HTML登录页面，Cookie可能无效")
+                    print("返回了HTML登录页面，Cookie可能无效")
                     return False
                 
                 try:
                     data = response.json()
                     if data.get('ok'):
-                        print("   ✅ 基础API测试通过")
+                        print("基础API测试通过")
                         return True
                     else:
-                        print(f"   ❌ API返回错误: {data.get('msg', 'Unknown error')}")
+                        print(f"API返回错误: {data.get('msg', 'Unknown error')}")
                         return False
                 except json.JSONDecodeError:
-                    print("   ❌ 返回的不是JSON格式")
+                    print("返回的不是JSON格式")
                     return False
             else:
-                print(f"   ❌ 请求失败，状态码: {response.status_code}")
+                print(f"请求失败，状态码: {response.status_code}")
                 return False
                 
         except Exception as e:
-            print(f"   ❌ 测试过程出错: {e}")
+            print(f"测试过程出错: {e}")
             return False
     
     def create_directories(self):
@@ -322,17 +322,17 @@ class WeiboAdvancedSearchCrawler:
                 saved_count += 1
         
         if saved_count > 0:
-            logging.info(f"✅ 成功保存了 {saved_count} 条数据 | 总计: {self.total_weibo_count} 条")
+            logging.info(f"成功保存了 {saved_count} 条数据 | 总计: {self.total_weibo_count} 条")
             
             # 立即保存到文件（而不是等待100条）
             self.save_to_excel_files()
         else:
-            logging.info(f"⚠️ 没有新数据保存，可能都是重复数据")
+            logging.info(f"没有新数据保存，可能都是重复数据")
     
     def save_to_excel_files(self):
         """将内存中的数据保存到Excel文件 - 每个关键词一个文件，每年一个工作表"""
         if self.total_weibo_count == 0:
-            logging.info("ℹ️ 没有数据需要保存")
+            logging.info("没有数据需要保存")
             return
             
         for keyword, year_data in self.keyword_data.items():
@@ -359,22 +359,22 @@ class WeiboAdvancedSearchCrawler:
                             
                             df.to_excel(writer, sheet_name=sheet_name, index=False)
                             
-                            logging.info(f"✅ 保存关键词 '{keyword}' {year}年数据: {len(data_list)} 条")
+                            logging.info(f"保存关键词 '{keyword}' {year}年数据: {len(data_list)} 条")
                 
-                logging.info(f"💾 关键词 '{keyword}' 数据已保存到: {filename}")
+                logging.info(f"关键词 '{keyword}' 数据已保存到: {filename}")
                 
             except Exception as e:
-                logging.error(f"❌ 保存关键词 '{keyword}' 数据失败: {e}")
+                logging.error(f"保存关键词 '{keyword}' 数据失败: {e}")
                 traceback.print_exc()
     
     def final_save(self):
         """最终保存 - 爬取完成后调用"""
-        logging.info("🚀 正在进行最终数据保存...")
+        logging.info("正在进行最终数据保存...")
         self.save_to_excel_files()
         if self.total_weibo_count > 0:
-            logging.info(f"🎉 所有数据保存完成！总计: {self.total_weibo_count} 条微博")
+            logging.info(f"所有数据保存完成！总计: {self.total_weibo_count} 条微博")
         else:
-            logging.info("ℹ️ 没有数据需要保存")
+            logging.info("没有数据需要保存")
     
     def _get_headers(self):
         """生成请求头 - 参考提供的代码"""
@@ -580,7 +580,7 @@ class WeiboAdvancedSearchCrawler:
                 try:
                     comment_text = self.get_comments(mid)
                     if comment_text:
-                        logging.info(f"✅ 成功获取微博 {mid} 的评论，共 {len(comment_text.split('||'))} 条")
+                        logging.info(f"成功获取微博 {mid} 的评论，共 {len(comment_text.split('||'))} 条")
                 except Exception as e:
                     logging.warning(f"获取评论失败: {str(e)}")
             
@@ -605,7 +605,7 @@ class WeiboAdvancedSearchCrawler:
     
     def advanced_search_by_date(self, keyword, search_date, max_pages=50):
         """使用高级搜索按日期搜索微博"""
-        print(f"🔍 开始搜索关键词 '{keyword}' 在日期 '{search_date}' 的微博...")
+        print(f"开始搜索关键词 '{keyword}' 在日期 '{search_date}' 的微博...")
         all_data = []
         
         # 构造高级搜索URL
@@ -663,9 +663,9 @@ class WeiboAdvancedSearchCrawler:
                         data = self.parse_weibo_card(card, keyword, search_date)
                         if data:
                             page_data.append(data)
-                            print(f"✅ 成功解析卡片 {i+1} | 用户: {data.get('用户', '未知')} | 用户ID: {data.get('用户ID', '未知')}")
+                            print(f"成功解析卡片 {i+1} | 用户: {data.get('用户', '未知')} | 用户ID: {data.get('用户ID', '未知')}")
                         else:
-                            print(f"❌ 卡片 {i+1} 解析失败")
+                            print(f"卡片 {i+1} 解析失败")
                     
                     if not page_data:
                         print(f"第 {page} 页无有效数据，终止采集")
@@ -717,34 +717,34 @@ class WeiboAdvancedSearchCrawler:
         date_range = generate_date_range(start_date, end_date)
         total_days = len(date_range)
         
-        print(f"📅 开始爬取历史数据，时间范围: {start_date} 到 {end_date}")
-        print(f"📊 总共 {total_days} 天，关键词: {keywords}")
+        print(f"开始爬取历史数据，时间范围: {start_date} 到 {end_date}")
+        print(f"总共 {total_days} 天，关键词: {keywords}")
         print("=" * 60)
         
         for i, date in enumerate(date_range, 1):
-            print(f"\n📅 正在处理第 {i}/{total_days} 天: {date}")
+            print(f"\n正在处理第 {i}/{total_days} 天: {date}")
             
             for keyword in keywords:
                 try:
-                    print(f"🔍 搜索关键词: {keyword}")
+                    print(f"搜索关键词: {keyword}")
                     data = self.advanced_search_by_date(keyword, date, max_pages_per_day)
                     
                     if data:
-                        print(f"✅ {date} 关键词 '{keyword}' 共获取 {len(data)} 条数据")
+                        print(f"{date} 关键词 '{keyword}' 共获取 {len(data)} 条数据")
                     else:
-                        print(f"ℹ️  {date} 关键词 '{keyword}' 无数据")
+                        print(f"{date} 关键词 '{keyword}' 无数据")
                     
                     # 关键词间延时
                     time.sleep(random.uniform(5, 10))
                     
                 except Exception as e:
-                    print(f"❌ {date} 关键词 '{keyword}' 采集失败: {str(e)}")
+                    print(f"{date} 关键词 '{keyword}' 采集失败: {str(e)}")
                     continue
             
             # 每天爬取完成后延时
             if i < total_days:
                 delay = random.uniform(10, 20)
-                print(f"⏳ 等待 {delay:.1f} 秒后继续下一日...")
+                print(f"等待 {delay:.1f} 秒后继续下一日...")
                 time.sleep(delay)
         
         # 爬取完成后进行最终保存
@@ -824,7 +824,7 @@ def main():
         print("请在新打开的浏览器窗口中完成登录操作")
         crawler = WeiboAdvancedSearchCrawler(config)
     except Exception as e:
-        print(f"❌ 初始化失败: {e}")
+        print(f"初始化失败: {e}")
         return
     
     # ========== 正常爬取流程 ==========
