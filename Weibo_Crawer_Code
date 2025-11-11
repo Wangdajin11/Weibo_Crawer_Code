@@ -1,0 +1,870 @@
+import requests
+import json
+from datetime import datetime, timedelta
+import csv
+import time
+import os
+import logging
+import threading
+from queue import Queue
+import schedule
+import random
+import re
+import pandas as pd
+import glob
+import getpass
+from urllib.parse import quote
+import traceback
+
+# 新增导入
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, WebDriverException
+from bs4 import BeautifulSoup
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('weibo_crawler.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+
+# ================== 工具函数 ==================
+def extract_user_id(url):
+    """从用户URL中提取用户ID - 增强版"""
+    if not url:
+        return ""
+    
+    # 处理各种微博用户URL格式
+    patterns = [
+        r'(?:/u/|/profile/|^/|^https?://weibo\.com/)(\d+)(?:\?.*)?$',
+        r'^https?://(?:www\.)?weibo\.com/p/100(\d{9})$',
+        r'^https?://(?:www\.)?weibo\.com/(\d+)/?.*$',
+        r'uid=(\d+)',  # 处理含uid参数的链接
+        r'weibo\.com/(\d+)\?',  # 处理带参数的链接
+        r'weibo\.com/u/(\d+)',  # 处理/u/格式
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, url or "")
+        if match:
+            user_id = match.group(1)
+            # 如果是100开头的特殊格式，需要处理
+            if pattern == r'^https?://(?:www\.)?weibo\.com/p/100(\d{9})$':
+                user_id = "100" + user_id
+            return user_id
+    return ""
+
+def sanitize_filename(keyword):
+    """清理非法文件名字符"""
+    return re.sub(r'[\\/*?:"<>|]', '_', keyword)[:120]
+
+def parse_interaction_count(text):
+    """解析互动数字（万单位处理）"""
+    if not text:
+        return 0
+    match = re.search(r'(\d+\.?\d*)(万?)', text)
+    if match:
+        num = float(match.group(1))
+        return int(num * 10000) if match.group(2) == '万' else int(num)
+    return 0
+
+def parse_weibo_time(text):
+    """智能解析微博时间格式"""
+    if not text:
+        return "", ""
+        
+    now = datetime.now()
+    clean_text = text.strip().replace("\u200b", "").replace("\xa0", " ").replace("\n", "")
+    
+    time_units = {
+        "刚刚": (0, 'seconds'),
+        "秒前": ('seconds', 1),
+        "分钟前": ('minutes', 1),
+        "小时前": ('hours', 1),
+        "天前": ('days', 1),
+        "昨天": ('days', 1)
+    }
+    
+    for pattern, (unit, mult) in time_units.items():
+        if pattern in clean_text:
+            if pattern == "昨天":
+                return (now - timedelta(days=1)).strftime('%Y-%m-%d') + " " + clean_text.split()[-1], text
+            num = int(re.search(r'\d+', clean_text).group()) if pattern != "刚刚" else 0
+            delta = {unit: num * mult} if unit else {}
+            return (now - timedelta(**delta)).strftime('%Y-%m-%d %H:%M:%S'), text
+
+    try:
+        dt = datetime.strptime(clean_text, "%Y年%m月%d日 %H:%M")
+        return dt.strftime('%Y-%m-%d %H:%M:%S'), text
+    except:
+        pass
+    
+    try:
+        dt = datetime.strptime(clean_text, "%m月%d日 %H:%M").replace(year=now.year)
+        return dt.strftime('%Y-%m-%d %H:%M:%S'), text
+    except:
+        pass
+    
+    return clean_text, text
+
+def generate_date_range(start_date, end_date):
+    """生成日期范围"""
+    start = datetime.strptime(start_date, "%Y-%m-%d")
+    end = datetime.strptime(end_date, "%Y-%m-%d")
+    date_list = []
+    
+    current = start
+    while current <= end:
+        date_list.append(current.strftime("%Y-%m-%d"))
+        current += timedelta(days=1)
+    
+    return date_list
+
+class WeiboAdvancedSearchCrawler:
+    def __init__(self, config):
+        self.session = requests.Session()
+        self.config = config
+        
+        # 使用Selenium登录获取Cookie
+        self.driver = self.setup_browser()
+        self.header = self.login_with_selenium()
+        
+        # 数据保存路径
+        self.base_path = r"D:\学习文件\休闲&兴趣\文章\论文\脑机接口"
+        
+        # 任务队列
+        self.task_queue = Queue()
+        self.crawled_mids = set()
+        self.is_running = True
+        
+        # 数据存储结构
+        # 按关键词和年份组织数据
+        self.keyword_data = {}
+        self.total_weibo_count = 0
+        
+        # 创建数据存储目录
+        self.create_directories()
+        
+        # 初始化数据结构
+        self.init_data_structure()
+    
+    def init_data_structure(self):
+        """初始化数据结构 - 按关键词和年份组织"""
+        for keyword in self.config['keywords']:
+            self.keyword_data[keyword] = {}
+            # 为每个关键词初始化年份数据存储
+            start_year = int(self.config['start_date'][:4])
+            end_year = int(self.config['end_date'][:4])
+            for year in range(start_year, end_year + 1):
+                self.keyword_data[keyword][str(year)] = []
+    
+    def setup_browser(self):
+        """设置浏览器"""
+        options = Options()
+        options.add_argument('--disable-blink-features=AutomationControlled')
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option("useAutomationExtension", False)
+        
+        service = Service()
+        driver = webdriver.Chrome(service=service, options=options)
+        return driver
+    
+    def login_with_selenium(self):
+        """使用Selenium自动化登录获取Cookie"""
+        print("\n" + "="*80)
+        print("🚀 启动微博自动化登录...")
+        print("="*80)
+        
+        try:
+            self.driver.get("https://weibo.com/login.php")
+            
+            print("📝 请在弹出的浏览器窗口中完成微博登录...")
+            print("💡 提示：")
+            print("   - 如果出现扫码登录，请使用微博APP扫码")
+            print("   - 如果使用账号密码登录，请确保账号正确")
+            print("   - 登录成功后，请在控制台按回车继续")
+            
+            # 等待用户手动登录后按回车
+            input("请在浏览器中完成登录，登录成功后按回车继续...")
+            
+            # 获取Cookie并构建请求头
+            cookies = self.driver.get_cookies()
+            cookie_str = '; '.join([f"{c['name']}={c['value']}" for c in cookies])
+            
+            # 构建请求头
+            header = {
+                'Cookie': cookie_str,
+                'User-Agent': self.driver.execute_script("return navigator.userAgent"),
+                'Referer': 'https://weibo.com/',
+                'Accept': 'application/json, text/plain, */*',
+                'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+                'X-Requested-With': 'XMLHttpRequest',
+                'Sec-Fetch-Dest': 'empty',
+                'Sec-Fetch-Mode': 'cors',
+                'Sec-Fetch-Site': 'same-origin'
+            }
+            
+            # 尝试提取XSRF-TOKEN
+            xsrf_match = re.search(r'XSRF-TOKEN=([^;]+)', cookie_str)
+            if xsrf_match:
+                header['X-XSRF-TOKEN'] = xsrf_match.group(1)
+                print(f"✅ 提取到XSRF-TOKEN: {xsrf_match.group(1)[:10]}...")
+            
+            print(f"✅ 成功获取Cookie（长度：{len(cookie_str)}字符）")
+            
+            # 测试Cookie有效性
+            if self.test_cookie_effectiveness(header):
+                print("✅ Cookie有效性测试通过！")
+            else:
+                print("⚠️ Cookie测试未通过，但继续运行...")
+            
+            return header
+            
+        except Exception as e:
+            print(f"❌ 自动化登录失败: {e}")
+            traceback.print_exc()
+            raise
+    
+    def smart_scroll(self):
+        """优化后的智能滚动加载"""
+        last_height = self.driver.execute_script("return document.body.scrollHeight")
+        retry = 0
+        
+        while retry < 5:  # SCROLL_RETRIES = 5
+            self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(random.uniform(1.0, 2.0))  # 优化等待时间
+            new_height = self.driver.execute_script("return document.body.scrollHeight")
+            
+            if new_height == last_height:
+                retry += 1
+                time.sleep(1)
+            else:
+                retry = 0
+                last_height = new_height
+
+    def test_cookie_effectiveness(self, headers):
+        """测试Cookie是否有效"""
+        try:
+            print("\n🔧 正在测试Cookie有效性...")
+            
+            # 测试基础API
+            url = "https://weibo.com/ajax/profile/info?uid=1669879400"
+            response = requests.get(url, headers=headers, timeout=10)
+            
+            if response.status_code == 200:
+                if response.text.startswith('<!DOCTYPE') or response.text.startswith('<html'):
+                    print("   ❌ 返回了HTML登录页面，Cookie可能无效")
+                    return False
+                
+                try:
+                    data = response.json()
+                    if data.get('ok'):
+                        print("   ✅ 基础API测试通过")
+                        return True
+                    else:
+                        print(f"   ❌ API返回错误: {data.get('msg', 'Unknown error')}")
+                        return False
+                except json.JSONDecodeError:
+                    print("   ❌ 返回的不是JSON格式")
+                    return False
+            else:
+                print(f"   ❌ 请求失败，状态码: {response.status_code}")
+                return False
+                
+        except Exception as e:
+            print(f"   ❌ 测试过程出错: {e}")
+            return False
+    
+    def create_directories(self):
+        """创建数据存储目录"""
+        try:
+            os.makedirs(os.path.join(self.base_path, 'WeiboData'), exist_ok=True)
+            logging.info(f"数据将保存到: {self.base_path}")
+        except Exception as e:
+            logging.error(f"创建目录失败: {e}")
+            raise
+    
+    def save_weibo_data(self, weibo_list, keyword, date):
+        """保存微博数据到内存结构，按关键词和年份组织"""
+        if not weibo_list:
+            return
+        
+        saved_count = 0
+        for data in weibo_list:
+            if data and data.get('mid') not in self.crawled_mids:
+                # 提取年份
+                pub_time = data.get('发布时间', '')
+                if pub_time and len(pub_time) >= 4:
+                    year = pub_time[:4]
+                else:
+                    # 如果没有发布时间，使用搜索日期的年份
+                    year = date[:4]
+                
+                # 动态创建数据结构（防止年份不在初始化范围内）
+                if keyword not in self.keyword_data:
+                    self.keyword_data[keyword] = {}
+                if year not in self.keyword_data[keyword]:
+                    self.keyword_data[keyword][year] = []
+                
+                # 将数据添加到对应的关键词和年份
+                self.keyword_data[keyword][year].append(data)
+                if data.get('mid'):
+                    self.crawled_mids.add(data['mid'])
+                self.total_weibo_count += 1
+                saved_count += 1
+        
+        if saved_count > 0:
+            logging.info(f"✅ 成功保存了 {saved_count} 条数据 | 总计: {self.total_weibo_count} 条")
+            
+            # 立即保存到文件（而不是等待100条）
+            self.save_to_excel_files()
+        else:
+            logging.info(f"⚠️ 没有新数据保存，可能都是重复数据")
+    
+    def save_to_excel_files(self):
+        """将内存中的数据保存到Excel文件 - 每个关键词一个文件，每年一个工作表"""
+        if self.total_weibo_count == 0:
+            logging.info("ℹ️ 没有数据需要保存")
+            return
+            
+        for keyword, year_data in self.keyword_data.items():
+            if not any(year_data.values()):  # 如果没有数据，跳过
+                continue
+                
+            # 创建文件名
+            filename = f"{sanitize_filename(keyword)}_微博数据.xlsx"
+            filepath = os.path.join(self.base_path, 'WeiboData', filename)
+            
+            try:
+                # 使用ExcelWriter来保存多个工作表
+                with pd.ExcelWriter(filepath, engine='openpyxl') as writer:
+                    for year, data_list in year_data.items():
+                        if data_list:  # 只保存有数据的年份
+                            # 转换为DataFrame
+                            df = pd.DataFrame(data_list)
+                            
+                            # 保存到对应的工作表
+                            sheet_name = f"{year}年"
+                            # Excel工作表名称限制在31个字符以内
+                            if len(sheet_name) > 31:
+                                sheet_name = sheet_name[:31]
+                            
+                            df.to_excel(writer, sheet_name=sheet_name, index=False)
+                            
+                            logging.info(f"✅ 保存关键词 '{keyword}' {year}年数据: {len(data_list)} 条")
+                
+                logging.info(f"💾 关键词 '{keyword}' 数据已保存到: {filename}")
+                
+            except Exception as e:
+                logging.error(f"❌ 保存关键词 '{keyword}' 数据失败: {e}")
+                traceback.print_exc()
+    
+    def final_save(self):
+        """最终保存 - 爬取完成后调用"""
+        logging.info("🚀 正在进行最终数据保存...")
+        self.save_to_excel_files()
+        if self.total_weibo_count > 0:
+            logging.info(f"🎉 所有数据保存完成！总计: {self.total_weibo_count} 条微博")
+        else:
+            logging.info("ℹ️ 没有数据需要保存")
+    
+    def _get_headers(self):
+        """生成请求头 - 参考提供的代码"""
+        cookies = {c['name']: c['value'] for c in self.driver.get_cookies()}
+        return {
+            'user-agent': self.driver.execute_script("return navigator.userAgent"),
+            'referer': 'https://weibo.com/',
+            'x-requested-with': 'XMLHttpRequest',
+            'cookie': '; '.join([f"{k}={v}" for k, v in cookies.items()])
+        }
+    
+    def get_comments(self, mid):
+        """修复评论获取功能 - 完全参考提供的代码"""
+        if not mid or not mid.isdigit():
+            return ""
+        
+        comments = []
+        max_id = None
+        
+        for _ in range(5):  # 减少评论获取深度
+            try:
+                params = {
+                    'is_reload': 1,
+                    'id': mid,
+                    'is_show_bulletin': 2,
+                    'count': 20,
+                    'max_id': max_id or 0
+                }
+                
+                # 使用参考代码的headers格式
+                headers = self._get_headers()
+                
+                response = requests.get(
+                    'https://weibo.com/ajax/statuses/buildComments',
+                    params=params,
+                    headers=headers,
+                    timeout=15
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    # 提取评论内容 - 使用text_raw字段
+                    comments.extend([c.get('text_raw', '') for c in data.get('data', [])])
+                    max_id = data.get('max_id', 0)
+                    if max_id <= 0:
+                        break
+                time.sleep(random.uniform(1.5, 2.5))
+                    
+            except Exception as e:
+                logging.warning(f"获取评论失败: {str(e)}")
+                break
+        
+        return '||'.join(filter(None, comments))
+    
+    def parse_weibo_card(self, card, keyword, search_date):
+        """优化解析逻辑 - 增强容错性，特别修复用户ID获取"""
+        try:
+            # 获取MID - 尝试多种方式
+            mid = ""
+            try:
+                # 尝试从card属性获取
+                mid = card.get('mid', '')
+                if not mid:
+                    # 尝试从mblog属性获取
+                    mblog = card.get('mblog', {})
+                    if mblog:
+                        mid = mblog.get('mid', '')
+                if not mid:
+                    # 尝试从链接中提取
+                    mid_match = re.search(r'mid=(\d+)', str(card))
+                    if mid_match:
+                        mid = mid_match.group(1)
+            except:
+                pass
+
+            # 用户信息解析 - 修复用户ID获取问题
+            user = "未知用户"
+            user_id = ""
+            try:
+                # 首先尝试获取用户链接和用户信息
+                user_selectors = [
+                    "a.name",
+                    ".name",
+                    ".username",
+                    "a[href*='weibo.com']",
+                    ".txt_attr"
+                ]
+                
+                for selector in user_selectors:
+                    user_tag = card.select_one(selector)
+                    if user_tag and user_tag.get_text(strip=True):
+                        user = user_tag.get_text(strip=True)
+                        user_link = user_tag.get('href', '')
+                        
+                        # 增强用户ID提取逻辑
+                        if user_link:
+                            user_id = extract_user_id(user_link)
+                            if user_id:
+                                break
+                        
+                        # 如果从链接中提取不到，尝试从其他属性中提取
+                        if not user_id:
+                            # 尝试从data-usercard属性中提取
+                            usercard = user_tag.get('usercard', '') or user_tag.get('data-usercard', '')
+                            if usercard and 'id=' in usercard:
+                                uid_match = re.search(r'id=(\d+)', usercard)
+                                if uid_match:
+                                    user_id = uid_match.group(1)
+                                    break
+                
+                # 如果仍然没有获取到用户ID，尝试从整个卡片中搜索用户ID
+                if not user_id:
+                    # 搜索所有可能的用户ID模式
+                    card_text = str(card)
+                    uid_patterns = [
+                        r'weibo\.com/(\d+)(?:\?|")',
+                        r'uid=(\d+)',
+                        r'usercard.*?id=(\d+)',
+                        r'/(\d+)/profile'
+                    ]
+                    
+                    for pattern in uid_patterns:
+                        uid_match = re.search(pattern, card_text)
+                        if uid_match:
+                            user_id = uid_match.group(1)
+                            break
+                            
+            except Exception as e:
+                logging.warning(f"用户信息解析失败: {e}")
+
+            # 内容解析 - 增强容错性
+            content = ""
+            try:
+                content_selectors = [
+                    "div[node-type='feed_list_content']",
+                    ".txt",
+                    ".weibo-text",
+                    ".content",
+                    "p"
+                ]
+                
+                for selector in content_selectors:
+                    content_tag = card.select_one(selector)
+                    if content_tag:
+                        content = content_tag.get_text(separator='', strip=True)
+                        if content:
+                            break
+            except:
+                pass
+
+            # 时间解析 - 增强容错性
+            pub_time = ""
+            raw_time = ""
+            try:
+                time_selectors = [
+                    "a[date]",
+                    ".from",
+                    ".time",
+                    ".date"
+                ]
+                
+                for selector in time_selectors:
+                    time_tag = card.select_one(selector)
+                    if time_tag:
+                        time_text = time_tag.get_text(strip=True)
+                        if time_text:
+                            pub_time, raw_time = parse_weibo_time(time_text)
+                            break
+            except:
+                pass
+
+            # 互动数据解析 - 增强容错性
+            reposts = 0
+            comments = 0
+            likes = 0
+            
+            try:
+                # 尝试多种方式获取互动数据
+                interaction_selectors = [
+                    "div.card-act ul li",
+                    ".card-act li",
+                    ".action li",
+                    ".toolbar span"
+                ]
+                
+                for selector in interaction_selectors:
+                    interactions = card.select(selector)
+                    if interactions and len(interactions) >= 3:
+                        reposts = parse_interaction_count(interactions[1].text) if len(interactions) > 1 else 0
+                        comments = parse_interaction_count(interactions[2].text) if len(interactions) > 2 else 0
+                        likes = parse_interaction_count(interactions[3].text) if len(interactions) > 3 else 0
+                        break
+            except:
+                pass
+
+            # 如果关键信息都为空，则跳过这条微博
+            if not content and not user and not pub_time:
+                return None
+            
+            # 获取评论
+            comment_text = ""
+            if mid:
+                try:
+                    comment_text = self.get_comments(mid)
+                    if comment_text:
+                        logging.info(f"✅ 成功获取微博 {mid} 的评论，共 {len(comment_text.split('||'))} 条")
+                except Exception as e:
+                    logging.warning(f"获取评论失败: {str(e)}")
+            
+            return {
+                "mid": mid,
+                "用户": user,
+                "用户ID": user_id,
+                "内容": content,
+                "发布时间": pub_time,
+                "原始时间": raw_time,
+                "转发": reposts,
+                "评论数": comments,
+                "点赞": likes,
+                "详细评论": comment_text,
+                "关键词": keyword,
+                "搜索日期": search_date
+            }
+            
+        except Exception as e:
+            logging.error(f"卡片解析失败: {str(e)}")
+            return None
+    
+    def advanced_search_by_date(self, keyword, search_date, max_pages=50):
+        """使用高级搜索按日期搜索微博"""
+        print(f"🔍 开始搜索关键词 '{keyword}' 在日期 '{search_date}' 的微博...")
+        all_data = []
+        
+        # 构造高级搜索URL
+        encoded_keyword = quote(keyword)
+        url = f"https://s.weibo.com/weibo?q={encoded_keyword}&typeall=1&suball=1&timescope=custom:{search_date}:{search_date}&page=1"
+        
+        for page in range(1, max_pages + 1):
+            print(f"正在采集第 {page} 页...")
+            retry = 0
+            
+            while retry < 3:
+                try:
+                    # 构造带页码的URL
+                    if page > 1:
+                        page_url = f"https://s.weibo.com/weibo?q={encoded_keyword}&typeall=1&suball=1&timescope=custom:{search_date}:{search_date}&page={page}"
+                    else:
+                        page_url = url
+                    
+                    print(f"访问URL: {page_url}")
+                    self.driver.get(page_url)
+                    
+                    # 等待页面加载 - 使用更宽松的条件
+                    WebDriverWait(self.driver, 20).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, "div.card"))
+                    )
+                    
+                    # 智能滚动加载更多内容
+                    self.smart_scroll()
+                    
+                    # 解析页面 - 使用更通用的选择器
+                    soup = BeautifulSoup(self.driver.page_source, 'html.parser')
+                    
+                    # 尝试多种卡片选择器
+                    card_selectors = [
+                        "div[action-type='feed_list_item']",
+                        "div.card",
+                        ".card",
+                        ".wb-card"
+                    ]
+                    
+                    cards = []
+                    for selector in card_selectors:
+                        cards = soup.select(selector)
+                        if cards:
+                            print(f"使用选择器 '{selector}' 找到 {len(cards)} 张卡片")
+                            break
+                    
+                    if not cards:
+                        print(f"第 {page} 页无数据，终止采集")
+                        return all_data
+                    
+                    page_data = []
+                    for i, card in enumerate(cards):
+                        print(f"解析第 {i+1} 张卡片...")
+                        data = self.parse_weibo_card(card, keyword, search_date)
+                        if data:
+                            page_data.append(data)
+                            print(f"✅ 成功解析卡片 {i+1} | 用户: {data.get('用户', '未知')} | 用户ID: {data.get('用户ID', '未知')}")
+                        else:
+                            print(f"❌ 卡片 {i+1} 解析失败")
+                    
+                    if not page_data:
+                        print(f"第 {page} 页无有效数据，终止采集")
+                        return all_data
+                    
+                    all_data.extend(page_data)
+                    self.save_weibo_data(page_data, keyword, search_date)
+                    print(f"第 {page} 页采集完成，共 {len(page_data)} 条数据")
+                    
+                    # 检查是否有下一页
+                    next_page_selectors = [
+                        "a.next",
+                        ".next",
+                        "a[class*='next']"
+                    ]
+                    
+                    has_next = False
+                    for selector in next_page_selectors:
+                        next_page = soup.select_one(selector)
+                        if next_page:
+                            has_next = True
+                            break
+                    
+                    if not has_next:
+                        print("没有下一页，终止采集")
+                        return all_data
+                    
+                    time.sleep(random.uniform(3, 6))  # 增加页面间随机等待
+                    break
+                    
+                except TimeoutException:
+                    retry += 1
+                    print(f"第 {page} 页加载超时，重试中 ({retry}/3)")
+                    # 尝试重新加载页面
+                    try:
+                        self.driver.refresh()
+                        time.sleep(5)
+                    except:
+                        pass
+                except Exception as e:
+                    print(f"第 {page} 页采集异常: {str(e)}")
+                    traceback.print_exc()
+                    break
+        
+        return all_data
+    
+    def crawl_historical_data(self, keywords, start_date, end_date, max_pages_per_day=50):
+        """爬取历史数据 - 按天爬取"""
+        date_range = generate_date_range(start_date, end_date)
+        total_days = len(date_range)
+        
+        print(f"📅 开始爬取历史数据，时间范围: {start_date} 到 {end_date}")
+        print(f"📊 总共 {total_days} 天，关键词: {keywords}")
+        print("=" * 60)
+        
+        for i, date in enumerate(date_range, 1):
+            print(f"\n📅 正在处理第 {i}/{total_days} 天: {date}")
+            
+            for keyword in keywords:
+                try:
+                    print(f"🔍 搜索关键词: {keyword}")
+                    data = self.advanced_search_by_date(keyword, date, max_pages_per_day)
+                    
+                    if data:
+                        print(f"✅ {date} 关键词 '{keyword}' 共获取 {len(data)} 条数据")
+                    else:
+                        print(f"ℹ️  {date} 关键词 '{keyword}' 无数据")
+                    
+                    # 关键词间延时
+                    time.sleep(random.uniform(5, 10))
+                    
+                except Exception as e:
+                    print(f"❌ {date} 关键词 '{keyword}' 采集失败: {str(e)}")
+                    continue
+            
+            # 每天爬取完成后延时
+            if i < total_days:
+                delay = random.uniform(10, 20)
+                print(f"⏳ 等待 {delay:.1f} 秒后继续下一日...")
+                time.sleep(delay)
+        
+        # 爬取完成后进行最终保存
+        self.final_save()
+    
+    def start_continuous_crawling(self, config):
+        """启动爬取任务"""
+        def crawl_task():
+            try:
+                # 爬取历史数据
+                if 'keywords' in config and 'start_date' in config and 'end_date' in config:
+                    self.crawl_historical_data(
+                        keywords=config['keywords'],
+                        start_date=config['start_date'],
+                        end_date=config['end_date'],
+                        max_pages_per_day=config.get('max_pages_per_day', 50)
+                    )
+                
+            except Exception as e:
+                logging.error(f"爬取任务出错: {e}")
+        
+        # 执行一次
+        crawl_task()
+        
+        # 如果是连续模式，设置定时任务
+        if config.get('mode') == 'continuous':
+            interval_hours = config.get('interval_hours', 6)
+            schedule.every(interval_hours).hours.do(crawl_task)
+            
+            logging.info(f"已设置每{interval_hours}小时执行一次爬取任务")
+            
+            while self.is_running:
+                schedule.run_pending()
+                time.sleep(60)
+    
+    def stop(self):
+        """停止爬虫"""
+        self.is_running = False
+        if hasattr(self, 'driver'):
+            try:
+                self.driver.quit()
+            except:
+                pass
+        logging.info("爬虫已停止")
+
+
+def main():
+    """主函数"""
+    
+    # ========== 配置区域 ==========
+    # 请根据需要修改以下配置
+    
+    config = {
+        # 运行模式: 'single'(单次运行) 或 'continuous'(24小时不间断)
+        'mode': 'single',
+        
+        # 要搜索的关键词列表
+        'keywords': [
+            #'修改为自己实际需要使用的关键词',
+        ],
+        
+        # 历史数据爬取时间范围
+        #'start_date': '根据需要，配置时间范围，格式为：2016-11-08',
+        #'end_date': '根据需要，配置时间范围，格式为：2016-12-31',  
+        
+        # 每天最多爬取的页数
+        'max_pages_per_day': 50, 
+        
+        # 连续模式下的爬取间隔（小时）
+        'interval_hours': 2,
+    }
+    
+    # ========== 创建爬虫实例 ==========
+    try:
+        print("\n正在初始化爬虫...")
+        print("请注意：程序将自动打开Chrome浏览器进行微博登录")
+        print("请在新打开的浏览器窗口中完成登录操作")
+        crawler = WeiboAdvancedSearchCrawler(config)
+    except Exception as e:
+        print(f"❌ 初始化失败: {e}")
+        return
+    
+    # ========== 正常爬取流程 ==========
+    
+    print("=" * 60)
+    print("微博历史数据爬虫系统启动")
+    print("=" * 60)
+    print(f"数据保存路径: {crawler.base_path}")
+    print(f"运行模式: {config['mode']}")
+    print(f"时间范围: {config['start_date']} 到 {config['end_date']}")
+    print(f"关键词: {', '.join(config['keywords'])}")
+    print("存储格式: 每个关键词一个Excel文件，每年一个工作表")
+    print(f"登录方式: Selenium自动化登录")
+    print("=" * 60)
+    print()
+    
+    try:
+        if config['mode'] == 'continuous':
+            logging.info("启动24小时不间断微博爬虫...")
+        else:
+            logging.info("启动历史数据爬取...")
+        
+        crawler.start_continuous_crawling(config)
+        
+    except KeyboardInterrupt:
+        print("\n" + "=" * 60)
+        logging.info("接收到停止信号...")
+        crawler.stop()
+        print("=" * 60)
+    except Exception as e:
+        logging.error(f"程序异常: {e}")
+        import traceback
+        traceback.print_exc()
+        crawler.stop()
+    finally:
+        print("\n" + "=" * 60)
+        print(f"爬取完成统计")
+        print(f"数据总数: {crawler.total_weibo_count} 条")
+        print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
